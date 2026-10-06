@@ -12,8 +12,21 @@ final class TunnelManager: ObservableObject {
 
     private var isStarting = false
     private var restartPending = false
+    private var pathChangeWorkItem: DispatchWorkItem?
+    private var lastInterfaceName: String?
 
-    private init() {}
+    private init() {
+        // Reconnect when the network path changes (e.g. a Wi-Fi↔cellular handoff)
+        // so the tunnel comes back instead of staying dropped. Block-based
+        // observer avoids needing an @objc selector on this non-NSObject singleton.
+        NotificationCenter.default.addObserver(
+            forName: .networkPathDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.networkPathChanged()
+        }
+    }
 
     func markDisconnected() {
         runOnMain {
@@ -53,18 +66,110 @@ final class TunnelManager: ObservableObject {
         isStarting = true
 
         DispatchQueue.global(qos: .userInteractive).async { [showErrorUI] in
-            let result: Result<Void, NSError>
-            do {
-                try JITEnableContext.shared.startTunnel()
-                result = .success(())
-            } catch {
-                result = .failure(error as NSError)
-            }
+            let result = self.connectWithRetry()
 
             DispatchQueue.main.async {
                 self.finishStart(result, showErrorUI: showErrorUI)
             }
         }
+    }
+
+    /// Attempts the tunnel connection a few times with a short backoff before
+    /// giving up. Cellular paths (and Wi-Fi↔cellular handoffs) are more prone to
+    /// transient connect failures than Wi-Fi, so a couple of retries turn a
+    /// spurious drop into a successful connection instead of an error alert.
+    private func connectWithRetry() -> Result<Void, NSError> {
+        let maxAttempts = 3
+        var lastError: NSError?
+
+        for attempt in 1...maxAttempts {
+            do {
+                try JITEnableContext.shared.startTunnel()
+                if attempt > 1 {
+                    LogManager.shared.addInfoLog("Tunnel connected on attempt \(attempt)")
+                }
+                return .success(())
+            } catch let error as NSError {
+                lastError = error
+
+                if Self.isPermanentTunnelError(error) || attempt == maxAttempts {
+                    break
+                }
+
+                let backoff = TimeInterval(attempt) // 1s, then 2s
+                LogManager.shared.addWarningLog(
+                    "Tunnel connect attempt \(attempt) failed: \(error.localizedDescription). Retrying in \(Int(backoff))s…"
+                )
+                Thread.sleep(forTimeInterval: backoff)
+            }
+        }
+
+        return .failure(lastError ?? NSError(
+            domain: "StikDebug",
+            code: -1,
+            userInfo: [NSLocalizedDescriptionKey: "Tunnel connection failed"]
+        ))
+    }
+
+    /// True for failures that another attempt won't fix — they need user action
+    /// (fresh pairing file, valid target IP), not a retry.
+    private static func isPermanentTunnelError(_ error: NSError) -> Bool {
+        // -9 invalid/expired pairing, -17 missing pairing, -18 bad target IP.
+        if [-9, -17, -18].contains(error.code) {
+            return true
+        }
+        let message = error.localizedDescription.lowercased()
+        return message.contains("parse target ip")
+            || message.contains("pairing file not found")
+    }
+
+    private func networkPathChanged() {
+        // Debounce: a handoff can emit several path updates in quick succession.
+        pathChangeWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            self?.handleNetworkPathChange()
+        }
+        pathChangeWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: item)
+    }
+
+    private func handleNetworkPathChange() {
+        let status = NetworkPathMonitor.shared.status
+        guard status.isReachable else { return }
+
+        let previous = lastInterfaceName
+        lastInterfaceName = status.interfaceName
+        let interfaceChanged = previous != nil && previous != status.interfaceName
+
+        // A tunnel established earlier survives a Wi-Fi↔cellular handoff: the
+        // connection rides LocalDevVPN's loopback, so the physical interface
+        // underneath it doesn't matter (verified on device — an active session
+        // kept working across the switch). Rebuilding here would tear down a
+        // live tunnel and, on cellular, fail to replace it.
+        guard !isConnected else {
+            if interfaceChanged {
+                LogManager.shared.addInfoLog(
+                    "Interface changed (\(previous ?? "?") → \(status.interfaceName)); keeping existing tunnel"
+                )
+            }
+            return
+        }
+
+        // A fresh connect needs the on-device Remote Pairing service, which has
+        // refused connections on cellular-only, so an automatic retry cycle
+        // there just burns battery. Manual attempts (the user tapping) still go
+        // through start() directly.
+        guard status.interface != .cellular else {
+            if interfaceChanged {
+                LogManager.shared.addInfoLog(
+                    "On cellular without Wi-Fi; deferring tunnel reconnect until a local network is available"
+                )
+            }
+            return
+        }
+
+        LogManager.shared.addInfoLog("Network path changed (\(status.description)); reconnecting tunnel")
+        start(showErrorUI: false)
     }
 
     private func finishStart(_ result: Result<Void, NSError>, showErrorUI: Bool) {

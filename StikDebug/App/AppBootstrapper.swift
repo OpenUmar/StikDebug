@@ -13,6 +13,8 @@ enum AppBootstrapper {
         registerDefaultSettings()
         ensureKeepAliveSelection()
         applyDocumentPickerCopyWorkaround()
+        NetworkPathMonitor.shared.start()
+        LocationSimulationSession.shared.restoreIfNeeded()
     }
 
     private static func registerDefaultSettings() {

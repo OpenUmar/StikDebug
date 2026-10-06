@@ -232,12 +232,13 @@ struct MainTabView: View {
                         )
                     ) {
                         LocationSimulationCommandQueue.shared.async {
-                            _ = simulate_location(
+                            let code = simulate_location(
                                 DeviceConnectionContext.targetIPAddress,
                                 coordinate.latitude,
                                 coordinate.longitude,
                                 pairingFile.path
                             )
+                            LocationSimulationSession.shared.noteResendResult(code)
                         }
                     }
                     LogManager.shared.addInfoLog(
@@ -255,6 +256,9 @@ struct MainTabView: View {
     }
 
     private func clearSimulatedLocation() {
+        // Stop resending before clearing: a resend queued behind the clear would
+        // otherwise re-apply the location a moment after it was cleared.
+        LocationSimulationSession.shared.pauseResending()
         LocationSimulationCommandQueue.shared.async {
             let code = clear_simulated_location()
             DispatchQueue.main.async {

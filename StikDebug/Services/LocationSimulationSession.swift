@@ -11,12 +11,21 @@ final class LocationSimulationSession: ObservableObject {
     private var resendTimer: Timer?
     private var routeID: UUID?
 
+    /// Remembers the coordinate being held across launches, so a simulation
+    /// survives the app being killed or the device rebooting.
+    private static let storageKey = "heldSimulatedLocation"
+
+    private let healthLock = NSLock()
+    private var consecutiveResendFailures = 0
+
     private init() {}
 
     func start(at coordinate: CLLocationCoordinate2D) {
         self.coordinate = coordinate
+        persist(coordinate)
         if !isActive {
             isActive = true
+            resetResendHealth()
             BackgroundAudioManager.shared.requestStart()
             BackgroundLocationManager.shared.requestStart()
         }
@@ -50,10 +59,14 @@ final class LocationSimulationSession: ObservableObject {
     func pauseResending() {
         resendTimer?.invalidate()
         resendTimer = nil
+        // Nothing is being held any more, so there is nothing to re-arm on the
+        // next launch. Whoever resumes (a new pin, a route) persists again.
+        persist(nil)
     }
 
     func updateCoordinate(_ coordinate: CLLocationCoordinate2D) {
         self.coordinate = coordinate
+        persist(coordinate)
     }
 
     func stop() {
@@ -62,7 +75,95 @@ final class LocationSimulationSession: ObservableObject {
         guard isActive else { return }
         isActive = false
         coordinate = nil
+        resetResendHealth()
         BackgroundAudioManager.shared.requestStop()
         BackgroundLocationManager.shared.requestStop()
+    }
+
+    // MARK: - Restore on launch
+
+    /// Re-arms a location that was still being held when the app last stopped
+    /// running. Call on the main thread.
+    ///
+    /// iOS gives sideloaded apps no way to launch themselves, so a reboot or a
+    /// kill always ends the simulation. Picking it straight back up on launch is
+    /// the next best thing: the resend tolerates failure, so this can be armed
+    /// before LocalDevVPN is connected and takes hold once it is.
+    func restoreIfNeeded() {
+        guard !isActive,
+              let values = UserDefaults.standard.array(forKey: Self.storageKey) as? [Double],
+              values.count == 2 else {
+            return
+        }
+
+        let restored = CLLocationCoordinate2D(latitude: values[0], longitude: values[1])
+        guard CLLocationCoordinate2DIsValid(restored) else {
+            persist(nil)
+            return
+        }
+
+        // Without a pairing file nothing can ever succeed, and retrying forever
+        // would just burn battery.
+        guard FileManager.default.fileExists(atPath: PairingFileStore.prepareURL().path) else {
+            return
+        }
+
+        LogManager.shared.addInfoLog(
+            String(format: "Restoring held simulated location: %.6f, %.6f", restored.latitude, restored.longitude)
+        )
+        startResending(at: restored) {
+            LocationSimulationCommandQueue.shared.async {
+                let code = simulate_location(
+                    DeviceConnectionContext.targetIPAddress,
+                    restored.latitude,
+                    restored.longitude,
+                    PairingFileStore.prepareURL().path
+                )
+                LocationSimulationSession.shared.noteResendResult(code)
+            }
+        }
+    }
+
+    private func persist(_ value: CLLocationCoordinate2D?) {
+        if let value {
+            UserDefaults.standard.set([value.latitude, value.longitude], forKey: Self.storageKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.storageKey)
+        }
+    }
+
+    // MARK: - Resend health
+
+    /// Surfaces whether the held location is actually being applied, without
+    /// spamming the log: the first failure, the recovery, and a heartbeat
+    /// roughly every five minutes while failing. Safe to call from any thread.
+    func noteResendResult(_ code: Int32) {
+        healthLock.lock()
+        let previousFailures = consecutiveResendFailures
+        consecutiveResendFailures = code == 0 ? 0 : previousFailures + 1
+        let failures = consecutiveResendFailures
+        healthLock.unlock()
+
+        if code == 0 {
+            if previousFailures > 0 {
+                LogManager.shared.addInfoLog(
+                    "Simulated location resend recovered after \(previousFailures) failed attempt(s)"
+                )
+            }
+        } else if failures == 1 {
+            LogManager.shared.addWarningLog(
+                "Simulated location resend failed (error \(code)); retrying every 4s"
+            )
+        } else if failures % 75 == 0 {
+            LogManager.shared.addWarningLog(
+                "Simulated location resend still failing after \(failures) attempts (error \(code)); the held location is NOT being applied"
+            )
+        }
+    }
+
+    private func resetResendHealth() {
+        healthLock.lock()
+        consecutiveResendFailures = 0
+        healthLock.unlock()
     }
 }
