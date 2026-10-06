@@ -256,9 +256,10 @@ struct MainTabView: View {
     }
 
     private func clearSimulatedLocation() {
-        // Stop resending before clearing: a resend queued behind the clear would
-        // otherwise re-apply the location a moment after it was cleared.
-        LocationSimulationSession.shared.pauseResending()
+        // End the session before clearing: a resend queued behind the clear would
+        // otherwise re-apply the location a moment after it was cleared, and
+        // clear_simulated_location() closes the connection even when it fails.
+        LocationSimulationSession.shared.stop()
         LocationSimulationCommandQueue.shared.async {
             let code = clear_simulated_location()
             DispatchQueue.main.async {
