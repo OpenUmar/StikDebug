@@ -1378,19 +1378,26 @@ struct LocationSimulationView: View {
         routeSpeedPrefetchTask = nil
         cancelRoutePlayback(resetMarker: true)
         stopResendLoop()
-        // End the session whether or not the clear succeeds.
-        // clear_simulated_location() closes the connection on every path, so a
-        // failed clear leaves nothing simulated; keeping the session active would
-        // leave Stop failing forever with the keep-alive still running, which is
-        // exactly the state a re-armed hold lands in when it never connected.
-        LocationSimulationSession.shared.stop()
+        // End the simulation now, but stand by on the open connection: a clear
+        // that succeeds keeps it, so a new location can be simulated afterwards
+        // even on cellular. A clear that fails has closed the connection (or
+        // never had one), so standing by would keep the app awake for nothing
+        // and leave Stop failing forever; go fully idle in that case.
+        LocationSimulationSession.shared.stop(keepingConnection: true)
         runLocationCommand(
             errorTitle: "Clear Failed",
             errorMessage: { code in "Could not clear simulated location (error \(code))." },
-            operation: clear_simulated_location
+            operation: {
+                let code = clear_simulated_location()
+                if code != 0 {
+                    DispatchQueue.main.async {
+                        LocationSimulationSession.shared.stop()
+                    }
+                }
+                return code
+            }
         ) {
             endBackgroundTask()
-            LocationSimulationSession.shared.stop()
         }
     }
 

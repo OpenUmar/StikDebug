@@ -755,7 +755,12 @@ private enum LocationSimulationState {
     static var remoteServer: OpaquePointer?
     static var locationSimulation: OpaquePointer?
 
+    /// True between a successful set and the next clear. Like the handles above,
+    /// only touched on `LocationSimulationCommandQueue`.
+    static var isSimulating = false
+
     static func cleanup() {
+        isSimulating = false
         if let locationSimulation {
             location_simulation_free(locationSimulation)
             self.locationSimulation = nil
@@ -785,6 +790,7 @@ func simulate_location(_ deviceIP: String, _ latitude: Double, _ longitude: Doub
             idevice_error_free(ffiError)
             LocationSimulationState.cleanup()
         } else {
+            LocationSimulationState.isSimulating = true
             return LocationSimulationStatus.ok
         }
     }
@@ -866,21 +872,56 @@ func simulate_location(_ deviceIP: String, _ latitude: Double, _ longitude: Doub
         return LocationSimulationStatus.locationSet
     }
 
+    LocationSimulationState.isSimulating = true
     return LocationSimulationStatus.ok
 }
 
+/// Stops simulating but keeps the connection open on success.
+///
+/// Opening a connection needs the device's service on port 49152, which is not
+/// reachable on cellular-only. Tearing the connection down here meant a Stop on
+/// cellular could not be followed by a new simulation until Wi-Fi returned. A
+/// connection that is kept can be reused by the next `simulate_location`, which
+/// still rebuilds it if it turns out to be dead.
 func clear_simulated_location() -> Int32 {
     guard let locationSimulation = LocationSimulationState.locationSimulation else {
         return LocationSimulationStatus.locationClear
     }
 
-    let ffiError = location_simulation_clear(locationSimulation)
-    LocationSimulationState.cleanup()
-
-    if let ffiError {
+    if let ffiError = location_simulation_clear(locationSimulation) {
         idevice_error_free(ffiError)
+        LocationSimulationState.cleanup()
         return LocationSimulationStatus.locationClear
     }
 
+    LocationSimulationState.isSimulating = false
     return LocationSimulationStatus.ok
+}
+
+enum IdleLocationSimulationPing {
+    /// No connection is open, so there is nothing to keep alive.
+    case noConnection
+    /// A location is being simulated; the resend loop is the traffic.
+    case simulating
+    case ok
+    case failed
+}
+
+/// Sends a harmless request over an idle simulation connection so it does not
+/// sit silent after a Stop. The request is another clear, which is a no-op when
+/// nothing is simulated; it is skipped while a location is active so it can
+/// never undo a simulation. Call on `LocationSimulationCommandQueue`.
+func ping_idle_location_simulation() -> IdleLocationSimulationPing {
+    guard let locationSimulation = LocationSimulationState.locationSimulation else {
+        return .noConnection
+    }
+    guard !LocationSimulationState.isSimulating else {
+        return .simulating
+    }
+
+    if let ffiError = location_simulation_clear(locationSimulation) {
+        idevice_error_free(ffiError)
+        return .failed
+    }
+    return .ok
 }

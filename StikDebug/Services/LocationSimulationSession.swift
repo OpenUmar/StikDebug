@@ -18,6 +18,14 @@ final class LocationSimulationSession: ObservableObject {
     private let healthLock = NSLock()
     private var consecutiveResendFailures = 0
 
+    /// After a Stop, nothing is simulated but the connection is kept open so a
+    /// new simulation can start without opening one (impossible on cellular).
+    /// Standby keeps the background keep-alive held and the connection busy for
+    /// as long as that idle connection exists.
+    private(set) var isStandingBy = false
+    private var standbyTimer: Timer?
+    private var standbyPingFailing = false
+
     private init() {}
 
     func start(at coordinate: CLLocationCoordinate2D) {
@@ -26,8 +34,13 @@ final class LocationSimulationSession: ObservableObject {
         if !isActive {
             isActive = true
             resetResendHealth()
-            BackgroundAudioManager.shared.requestStart()
-            BackgroundLocationManager.shared.requestStart()
+            if isStandingBy {
+                // Standby already holds the keep-alive; hand it over.
+                endStandbyTimer()
+            } else {
+                BackgroundAudioManager.shared.requestStart()
+                BackgroundLocationManager.shared.requestStart()
+            }
         }
     }
 
@@ -69,15 +82,84 @@ final class LocationSimulationSession: ObservableObject {
         persist(coordinate)
     }
 
-    func stop() {
+    /// Ends the simulation. With `keepingConnection`, the session drops into
+    /// standby instead of going idle, so the open connection stays usable.
+    func stop(keepingConnection: Bool = false) {
         pauseResending()
         clearRoute()
-        guard isActive else { return }
-        isActive = false
-        coordinate = nil
-        resetResendHealth()
-        BackgroundAudioManager.shared.requestStop()
-        BackgroundLocationManager.shared.requestStop()
+
+        let holdsKeepAlive = isActive || isStandingBy
+        if isActive {
+            isActive = false
+            coordinate = nil
+            resetResendHealth()
+        }
+        guard holdsKeepAlive else { return }
+
+        if keepingConnection {
+            beginStandby()
+        } else {
+            endStandbyTimer()
+            BackgroundAudioManager.shared.requestStop()
+            BackgroundLocationManager.shared.requestStop()
+        }
+    }
+
+    // MARK: - Standby
+
+    private func beginStandby() {
+        guard !isStandingBy else { return }
+        isStandingBy = true
+        standbyPingFailing = false
+        LogManager.shared.addInfoLog(
+            "Simulated location stopped; keeping the connection open so it can be re-armed without Wi-Fi"
+        )
+
+        let timer = Timer(timeInterval: 4, repeats: true) { [weak self] _ in
+            LocationSimulationCommandQueue.shared.async {
+                let result = ping_idle_location_simulation()
+                DispatchQueue.main.async {
+                    self?.handleStandbyPing(result)
+                }
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        standbyTimer = timer
+    }
+
+    private func endStandbyTimer() {
+        standbyTimer?.invalidate()
+        standbyTimer = nil
+        isStandingBy = false
+    }
+
+    private func handleStandbyPing(_ result: IdleLocationSimulationPing) {
+        guard isStandingBy else { return }
+
+        switch result {
+        case .noConnection:
+            // The connection is gone, so there is nothing left to keep awake for.
+            endStandbyTimer()
+            BackgroundAudioManager.shared.requestStop()
+            BackgroundLocationManager.shared.requestStop()
+            LogManager.shared.addWarningLog(
+                "Idle simulation connection closed; a new simulation will need Wi-Fi or a hotspot"
+            )
+        case .failed:
+            if !standbyPingFailing {
+                standbyPingFailing = true
+                LogManager.shared.addWarningLog(
+                    "Idle simulation connection is not responding; re-arming may need Wi-Fi or a hotspot"
+                )
+            }
+        case .ok:
+            if standbyPingFailing {
+                standbyPingFailing = false
+                LogManager.shared.addInfoLog("Idle simulation connection is responding again")
+            }
+        case .simulating:
+            break
+        }
     }
 
     // MARK: - Restore on launch
