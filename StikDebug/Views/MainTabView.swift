@@ -256,17 +256,18 @@ struct MainTabView: View {
     }
 
     private func clearSimulatedLocation() {
-        // End the session before clearing: a resend queued behind the clear would
-        // otherwise re-apply the location a moment after it was cleared, and
-        // clear_simulated_location() closes the connection even when it fails.
-        LocationSimulationSession.shared.stop()
+        // End the simulation before clearing, so a resend queued behind the clear
+        // cannot re-apply the location, but stand by on the connection: a clear
+        // that succeeds keeps it open for the next simulation.
+        LocationSimulationSession.shared.stop(keepingConnection: true)
         LocationSimulationCommandQueue.shared.async {
             let code = clear_simulated_location()
             DispatchQueue.main.async {
                 if code == 0 {
-                    LocationSimulationSession.shared.stop()
                     LogManager.shared.addInfoLog("Cleared simulated location from URL")
                 } else {
+                    // A failed clear has closed the connection; nothing to stand by on.
+                    LocationSimulationSession.shared.stop()
                     showAlert(
                         title: "Clear Location Failed",
                         message: "Could not clear simulated location from URL (error \(code)).",
