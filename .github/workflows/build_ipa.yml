@@ -2,7 +2,7 @@ name: Build Debug IPA
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "location-plus" ]
     tags: [ "[0-9]*" ]
   pull_request:
     branches: [ "main" ]

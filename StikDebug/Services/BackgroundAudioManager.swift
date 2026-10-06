@@ -93,7 +93,23 @@ final class BackgroundAudioManager {
         let frameCount = AVAudioFrameCount(format.sampleRate)
         guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return }
         buffer.frameLength = frameCount
-        // PCM buffer is zero-initialized — pure silence
+
+        // Fill with an inaudible but non-zero signal. Some iOS versions treat a
+        // purely digital-silent playback session as idle and reclaim it, which
+        // lets the app get suspended in the background. A tiny alternating sample
+        // (~-80 dBFS, DC-free) keeps the session genuinely "playing" while staying
+        // far below anything audible or disruptive to the foreground app's audio.
+        if !format.isInterleaved, let channels = buffer.floatChannelData {
+            let amplitude: Float = 0.0001
+            let frames = Int(frameCount)
+            for channel in 0..<Int(format.channelCount) {
+                let samples = channels[channel]
+                for frame in 0..<frames {
+                    samples[frame] = (frame & 1 == 0) ? amplitude : -amplitude
+                }
+            }
+        }
+
         player.scheduleBuffer(buffer, at: nil, options: .loops)
     }
 

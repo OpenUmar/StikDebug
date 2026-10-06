@@ -1404,7 +1404,7 @@ struct LocationSimulationView: View {
         simulatedCoordinate = coordinate
         LocationSimulationSession.shared.startResending(at: coordinate) {
             LocationSimulationCommandQueue.shared.async {
-                _ = locationUpdateCode(for: coordinate)
+                LocationSimulationSession.shared.noteResendResult(locationUpdateCode(for: coordinate))
             }
         }
     }
@@ -1557,6 +1557,7 @@ struct LocationSimulationView: View {
                     await MainActor.run {
                         routePlaybackTask = nil
                         routePlaybackCoordinate = lastSuccessfulCoordinate
+                        LocationSimulationSession.shared.clearRoute()
                         if let lastSuccessfulCoordinate {
                             startResendLoop(with: lastSuccessfulCoordinate)
                         }
@@ -1577,6 +1578,11 @@ struct LocationSimulationView: View {
             await MainActor.run {
                 guard LocationSimulationSession.shared.isCurrentRoute(routeID) else { return }
                 routePlaybackTask = nil
+                // The route is over. Left set, the session keeps reporting a
+                // running route, which locks map taps, search and bookmarks and
+                // leaves Stop (which closes the connection) as the only way to
+                // move. Clearing it lets a new pin reuse the open connection.
+                LocationSimulationSession.shared.clearRoute()
                 if let lastSuccessfulCoordinate {
                     routePlaybackCoordinate = lastSuccessfulCoordinate
                     startResendLoop(with: lastSuccessfulCoordinate)
