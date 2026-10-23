@@ -119,8 +119,13 @@ final class TunnelManager: ObservableObject {
             return true
         }
         let message = error.localizedDescription.lowercased()
+        // A refusal means nothing is listening on the port that was dialled; a
+        // few seconds later nothing will be either. Each attempt also re-runs
+        // Remote Pairing port discovery, which can take ~6s, so retrying a
+        // refusal mostly delays the error.
         return message.contains("parse target ip")
             || message.contains("pairing file not found")
+            || message.contains("connection refused")
     }
 
     private func networkPathChanged() {
@@ -155,19 +160,9 @@ final class TunnelManager: ObservableObject {
             return
         }
 
-        // A fresh connect needs the on-device Remote Pairing service, which has
-        // refused connections on cellular-only, so an automatic retry cycle
-        // there just burns battery. Manual attempts (the user tapping) still go
-        // through start() directly.
-        guard status.interface != .cellular else {
-            if interfaceChanged {
-                LogManager.shared.addInfoLog(
-                    "On cellular without Wi-Fi; deferring tunnel reconnect until a local network is available"
-                )
-            }
-            return
-        }
-
+        // Cellular included: Remote Pairing port discovery may find the service
+        // where the fixed port was refused. A refusal is no longer retried, so
+        // a failing attempt here costs one discovery and one connect.
         LogManager.shared.addInfoLog("Network path changed (\(status.description)); reconnecting tunnel")
         start(showErrorUI: false)
     }

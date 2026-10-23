@@ -884,14 +884,17 @@ func simulate_location(_ deviceIP: String, _ latitude: Double, _ longitude: Doub
 
 /// Stops simulating but keeps the connection open on success.
 ///
-/// Opening a connection needs the device's service on port 49152, which is not
-/// reachable on cellular-only. Tearing the connection down here meant a Stop on
-/// cellular could not be followed by a new simulation until Wi-Fi returned. A
+/// Opening a connection needs the device's Remote Pairing service, and that has
+/// been refused on cellular-only. Tearing the connection down here meant a Stop
+/// on cellular could not be followed by a new simulation until Wi-Fi returned. A
 /// connection that is kept can be reused by the next `simulate_location`, which
 /// still rebuilds it if it turns out to be dead.
 func clear_simulated_location() -> Int32 {
     guard let locationSimulation = LocationSimulationState.locationSimulation else {
-        return LocationSimulationStatus.locationClear
+        // No connection means nothing is being simulated by this app: the device
+        // drops a simulation when its connection closes. Report success rather
+        // than a failed clear the user can do nothing about.
+        return LocationSimulationStatus.ok
     }
 
     if let ffiError = location_simulation_clear(locationSimulation) {

@@ -214,6 +214,9 @@ struct MainTabView: View {
             return
         }
 
+        // Hold back resends of the current location until this one lands, or a
+        // resend queued while it runs would re-apply the old spot afterwards.
+        LocationSimulationSession.shared.suspendResending()
         LocationSimulationCommandQueue.shared.async {
             let code = simulate_location(
                 DeviceConnectionContext.targetIPAddress,
@@ -242,6 +245,7 @@ struct MainTabView: View {
                         String(format: "Simulated location from URL: %.6f, %.6f", coordinate.latitude, coordinate.longitude)
                     )
                 } else {
+                    LocationSimulationSession.shared.resumeResending()
                     showAlert(
                         title: "Location Simulation Failed",
                         message: "Could not simulate location from URL (error \(code)). Make sure the device is connected and the DDI is mounted.",

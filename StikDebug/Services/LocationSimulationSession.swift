@@ -9,23 +9,28 @@ final class LocationSimulationSession: ObservableObject {
     @Published private(set) var coordinate: CLLocationCoordinate2D?
     @Published private(set) var routeCoordinates: [CLLocationCoordinate2D]?
     private var resendTimer: Timer?
-    private var routeID: UUID?
 
     /// Remembers the coordinate being held across launches, so a simulation
     /// survives the app being killed or the device rebooting.
     private static let storageKey = "heldSimulatedLocation"
 
-    private let healthLock = NSLock()
+    /// Guards the state below, which is touched both on the main thread and on
+    /// `LocationSimulationCommandQueue`.
+    private let lock = NSLock()
+    private var routeID: UUID?
     private var consecutiveResendFailures = 0
-
-    private let commandLock = NSLock()
     private var resendInFlight = false
     private var standbyPingInFlight = false
 
-    /// After a Stop, nothing is simulated but the connection is kept open so a
-    /// new simulation can start without opening one (impossible on cellular).
-    /// Standby keeps the background keep-alive held and the connection busy for
-    /// as long as that idle connection exists.
+    /// The hold being re-applied, kept so resends can be suspended while another
+    /// command runs and resumed if that command fails. Main thread only.
+    private var resendBase: CLLocationCoordinate2D?
+    private var resendOperation: ((CLLocationCoordinate2D) -> Int32)?
+
+    /// After a Stop, nothing is simulated but the connection is kept open, so a
+    /// new simulation can start without opening one; opening one has been refused
+    /// on cellular-only. Standby keeps the background keep-alive held and the
+    /// connection busy for as long as that idle connection exists.
     private(set) var isStandingBy = false
     private var standbyTimer: Timer?
     private var standbyPingFailing = false
@@ -48,6 +53,8 @@ final class LocationSimulationSession: ObservableObject {
         }
     }
 
+    // MARK: - Resending
+
     /// Re-applies the held location every 4s. `operation` receives the
     /// coordinate to set, runs on `LocationSimulationCommandQueue`, and returns
     /// the simulation status code.
@@ -56,15 +63,74 @@ final class LocationSimulationSession: ObservableObject {
         _ operation: @escaping (CLLocationCoordinate2D) -> Int32
     ) {
         start(at: coordinate)
+        resendBase = coordinate
+        resendOperation = operation
         driftOffset = (north: 0, east: 0)
+        scheduleResendTimer()
+    }
+
+    /// Stops resends while another command (a new location, a route) is being
+    /// applied, so a resend of the old location cannot be queued behind it and
+    /// land afterwards. Pair with `resumeResending()` if that command fails.
+    func suspendResending() {
+        resendTimer?.invalidate()
+        resendTimer = nil
+    }
+
+    /// Restarts the resends of the current hold after a failed command.
+    func resumeResending() {
+        guard isActive, resendTimer == nil, resendBase != nil else { return }
+        scheduleResendTimer()
+    }
+
+    func pauseResending() {
+        suspendResending()
+        resendBase = nil
+        resendOperation = nil
+        // Nothing is being held any more, so there is nothing to re-arm on the
+        // next launch. Whoever resumes (a new pin, a route) persists again.
+        persist(nil)
+    }
+
+    private func scheduleResendTimer() {
+        guard let base = resendBase, let operation = resendOperation else { return }
         resendTimer?.invalidate()
         let timer = Timer(timeInterval: 4, repeats: true) { [weak self] _ in
             guard let self else { return }
-            let target = self.nextResendCoordinate(around: coordinate)
-            self.enqueueResend { operation(target) }
+            let target = self.nextResendCoordinate(around: base)
+            self.enqueueOnce(\.resendInFlight) {
+                self.noteResendResult(operation(target))
+            }
         }
         RunLoop.main.add(timer, forMode: .common)
         resendTimer = timer
+    }
+
+    /// Runs `work` on the command queue unless the previous run guarded by the
+    /// same flag is still in progress.
+    ///
+    /// Opening a fresh connection can block for several seconds while the Remote
+    /// Pairing port is discovered, and a request on a dead connection can hang.
+    /// Work arriving every 4s would then stack up faster than it drains, and
+    /// Simulate and Stop, which share the queue, would wait behind the backlog.
+    private func enqueueOnce(
+        _ flag: ReferenceWritableKeyPath<LocationSimulationSession, Bool>,
+        _ work: @escaping () -> Void
+    ) {
+        lock.lock()
+        guard !self[keyPath: flag] else {
+            lock.unlock()
+            return
+        }
+        self[keyPath: flag] = true
+        lock.unlock()
+
+        LocationSimulationCommandQueue.shared.async {
+            work()
+            self.lock.lock()
+            self[keyPath: flag] = false
+            self.lock.unlock()
+        }
     }
 
     // MARK: - Drift
@@ -104,59 +170,40 @@ final class LocationSimulationSession: ObservableObject {
         )
     }
 
-    /// Opening a fresh connection can block for several seconds while the Remote
-    /// Pairing port is discovered. When every attempt fails (cellular-only), a
-    /// resend every 4s would stack up on the command queue faster than it drains,
-    /// and Simulate and Stop, which share that queue, would wait behind the
-    /// backlog. Skip a tick while the previous resend is still running.
-    private func enqueueResend(_ operation: @escaping () -> Int32) {
-        commandLock.lock()
-        guard !resendInFlight else {
-            commandLock.unlock()
-            return
-        }
-        resendInFlight = true
-        commandLock.unlock()
-
-        LocationSimulationCommandQueue.shared.async { [weak self] in
-            let code = operation()
-            guard let self else { return }
-            self.commandLock.lock()
-            self.resendInFlight = false
-            self.commandLock.unlock()
-            self.noteResendResult(code)
-        }
-    }
+    // MARK: - Routes
 
     func startRoute(at coordinate: CLLocationCoordinate2D, coordinates: [CLLocationCoordinate2D]) -> UUID {
         let routeID = UUID()
+        lock.lock()
         self.routeID = routeID
+        lock.unlock()
         routeCoordinates = coordinates
         start(at: coordinate)
         return routeID
     }
 
+    /// Safe to call from any thread. Route samples check this on the command
+    /// queue right before they are applied, so a sample queued after a Stop or a
+    /// new route is dropped instead of re-simulating a stale point.
     func isCurrentRoute(_ routeID: UUID) -> Bool {
-        self.routeID == routeID
+        lock.lock()
+        defer { lock.unlock() }
+        return self.routeID == routeID
     }
 
     func clearRoute() {
+        lock.lock()
         routeID = nil
+        lock.unlock()
         routeCoordinates = nil
-    }
-
-    func pauseResending() {
-        resendTimer?.invalidate()
-        resendTimer = nil
-        // Nothing is being held any more, so there is nothing to re-arm on the
-        // next launch. Whoever resumes (a new pin, a route) persists again.
-        persist(nil)
     }
 
     func updateCoordinate(_ coordinate: CLLocationCoordinate2D) {
         self.coordinate = coordinate
         persist(coordinate)
     }
+
+    // MARK: - Stop
 
     /// Ends the simulation. With `keepingConnection`, the session drops into
     /// standby instead of going idle, so the open connection stays usable.
@@ -192,33 +239,16 @@ final class LocationSimulationSession: ObservableObject {
         )
 
         let timer = Timer(timeInterval: 4, repeats: true) { [weak self] _ in
-            self?.enqueueStandbyPing()
+            guard let self else { return }
+            self.enqueueOnce(\.standbyPingInFlight) {
+                let result = ping_idle_location_simulation()
+                DispatchQueue.main.async {
+                    self.handleStandbyPing(result)
+                }
+            }
         }
         RunLoop.main.add(timer, forMode: .common)
         standbyTimer = timer
-    }
-
-    /// Like resends, pings must not stack up behind one that is stuck on an
-    /// unresponsive connection.
-    private func enqueueStandbyPing() {
-        commandLock.lock()
-        guard !standbyPingInFlight else {
-            commandLock.unlock()
-            return
-        }
-        standbyPingInFlight = true
-        commandLock.unlock()
-
-        LocationSimulationCommandQueue.shared.async { [weak self] in
-            let result = ping_idle_location_simulation()
-            guard let self else { return }
-            self.commandLock.lock()
-            self.standbyPingInFlight = false
-            self.commandLock.unlock()
-            DispatchQueue.main.async {
-                self.handleStandbyPing(result)
-            }
-        }
     }
 
     private func endStandbyTimer() {
@@ -252,6 +282,8 @@ final class LocationSimulationSession: ObservableObject {
                 LogManager.shared.addInfoLog("Idle simulation connection is responding again")
             }
         case .simulating:
+            // A new simulation has been applied and its success has not reached
+            // the main thread yet; start(at:) will end standby.
             break
         }
     }
@@ -279,8 +311,10 @@ final class LocationSimulationSession: ObservableObject {
         }
 
         // Without a pairing file nothing can ever succeed, and retrying forever
-        // would just burn battery.
-        guard FileManager.default.fileExists(atPath: PairingFileStore.prepareURL().path) else {
+        // would just burn battery. Resolved once here; resends only read it when
+        // they have to open a fresh connection.
+        let pairingPath = PairingFileStore.prepareURL().path
+        guard FileManager.default.fileExists(atPath: pairingPath) else {
             return
         }
 
@@ -292,7 +326,7 @@ final class LocationSimulationSession: ObservableObject {
                 DeviceConnectionContext.targetIPAddress,
                 target.latitude,
                 target.longitude,
-                PairingFileStore.prepareURL().path
+                pairingPath
             )
         }
     }
@@ -311,11 +345,11 @@ final class LocationSimulationSession: ObservableObject {
     /// spamming the log: the first failure, the recovery, and a heartbeat
     /// roughly every five minutes while failing. Safe to call from any thread.
     private func noteResendResult(_ code: Int32) {
-        healthLock.lock()
+        lock.lock()
         let previousFailures = consecutiveResendFailures
         consecutiveResendFailures = code == 0 ? 0 : previousFailures + 1
         let failures = consecutiveResendFailures
-        healthLock.unlock()
+        lock.unlock()
 
         if code == 0 {
             if previousFailures > 0 {
@@ -335,8 +369,8 @@ final class LocationSimulationSession: ObservableObject {
     }
 
     private func resetResendHealth() {
-        healthLock.lock()
+        lock.lock()
         consecutiveResendFailures = 0
-        healthLock.unlock()
+        lock.unlock()
     }
 }

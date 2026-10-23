@@ -1307,12 +1307,16 @@ struct LocationSimulationView: View {
 
     private func simulate() {
         guard pairingExists, let coord = coordinate, !isBusy else { return }
+        // Hold back resends of the current location until this one lands, or a
+        // resend queued while it runs would re-apply the old spot afterwards.
+        LocationSimulationSession.shared.suspendResending()
         runLocationCommand(
             errorTitle: "Simulation Failed",
             errorMessage: { code in
                 "Could not simulate location (error \(code)). Make sure the device is connected and the DDI is mounted."
             },
-            operation: { locationUpdateCode(for: coord) }
+            operation: { locationUpdateCode(for: coord) },
+            onFailure: { LocationSimulationSession.shared.resumeResending() }
         ) {
             routePlaybackCoordinate = nil
             beginBackgroundTask()
@@ -1328,16 +1332,18 @@ struct LocationSimulationView: View {
               !isBusy else {
             return
         }
-        stopResendLoop()
+        LocationSimulationSession.shared.suspendResending()
         cancelRoutePlayback(resetMarker: false)
         runLocationCommand(
             errorTitle: "Route Simulation Failed",
             errorMessage: { code in
                 "Could not start route simulation (error \(code)). Make sure the device is connected and the DDI is mounted."
             },
-            operation: { locationUpdateCode(for: firstCoordinate) }
+            operation: { locationUpdateCode(for: firstCoordinate) },
+            onFailure: { LocationSimulationSession.shared.resumeResending() }
         ) {
             beginBackgroundTask()
+            LocationSimulationSession.shared.pauseResending()
             let routeID = LocationSimulationSession.shared.startRoute(
                 at: firstCoordinate,
                 coordinates: routePlan.displayCoordinates
@@ -1352,6 +1358,7 @@ struct LocationSimulationView: View {
         errorTitle: String,
         errorMessage: @escaping (Int32) -> String,
         operation: @escaping () -> Int32,
+        onFailure: (() -> Void)? = nil,
         onSuccess: @escaping () -> Void
     ) {
         isBusy = true
@@ -1362,6 +1369,7 @@ struct LocationSimulationView: View {
                 if code == 0 {
                     onSuccess()
                 } else {
+                    onFailure?()
                     alertTitle = errorTitle
                     alertMessage = errorMessage(code)
                     showAlert = true
@@ -1377,25 +1385,17 @@ struct LocationSimulationView: View {
         routeSpeedPrefetchTask?.cancel()
         routeSpeedPrefetchTask = nil
         cancelRoutePlayback(resetMarker: true)
-        stopResendLoop()
+        simulatedCoordinate = nil
         // End the simulation now, but stand by on the open connection: a clear
         // that succeeds keeps it, so a new location can be simulated afterwards
-        // even on cellular. A clear that fails has closed the connection (or
-        // never had one), so standing by would keep the app awake for nothing
-        // and leave Stop failing forever; go fully idle in that case.
+        // even on cellular. A clear that fails has closed the connection, so
+        // standing by would keep the app awake for nothing; go fully idle then.
         LocationSimulationSession.shared.stop(keepingConnection: true)
         runLocationCommand(
             errorTitle: "Clear Failed",
             errorMessage: { code in "Could not clear simulated location (error \(code))." },
-            operation: {
-                let code = clear_simulated_location()
-                if code != 0 {
-                    DispatchQueue.main.async {
-                        LocationSimulationSession.shared.stop()
-                    }
-                }
-                return code
-            }
+            operation: clear_simulated_location,
+            onFailure: { LocationSimulationSession.shared.stop() }
         ) {
             endBackgroundTask()
         }
@@ -1414,14 +1414,17 @@ struct LocationSimulationView: View {
 
     private func startResendLoop(with coordinate: CLLocationCoordinate2D) {
         simulatedCoordinate = coordinate
+        // Resolved once rather than on every 4s resend: prepareURL() does file
+        // I/O, and resends only read the file when they reopen a connection.
+        let pairingPath = pairingFilePath
         LocationSimulationSession.shared.startResending(at: coordinate) { target in
-            locationUpdateCode(for: target)
+            simulate_location(
+                DeviceConnectionContext.targetIPAddress,
+                target.latitude,
+                target.longitude,
+                pairingPath
+            )
         }
-    }
-
-    private func stopResendLoop() {
-        LocationSimulationSession.shared.pauseResending()
-        simulatedCoordinate = nil
     }
 
     private func cancelRoutePlayback(resetMarker: Bool) {
@@ -1561,7 +1564,7 @@ struct LocationSimulationView: View {
                     return
                 }
 
-                let code = await sendLocationUpdate(for: sample.coordinate)
+                let code = await sendLocationUpdate(for: sample.coordinate, routeID: routeID)
                 guard LocationSimulationSession.shared.isCurrentRoute(routeID) else { return }
                 guard code == 0 else {
                     await MainActor.run {
@@ -1590,8 +1593,8 @@ struct LocationSimulationView: View {
                 routePlaybackTask = nil
                 // The route is over. Left set, the session keeps reporting a
                 // running route, which locks map taps, search and bookmarks and
-                // leaves Stop (which closes the connection) as the only way to
-                // move. Clearing it lets a new pin reuse the open connection.
+                // leaves Stop as the only way to move. Clearing it lets a new pin
+                // be simulated straight over the open connection.
                 LocationSimulationSession.shared.clearRoute()
                 if let lastSuccessfulCoordinate {
                     routePlaybackCoordinate = lastSuccessfulCoordinate
@@ -1601,9 +1604,18 @@ struct LocationSimulationView: View {
         }
     }
 
-    private func sendLocationUpdate(for coordinate: CLLocationCoordinate2D) async -> Int32 {
+    private func sendLocationUpdate(for coordinate: CLLocationCoordinate2D, routeID: UUID) async -> Int32 {
         await withCheckedContinuation { continuation in
             LocationSimulationCommandQueue.shared.async {
+                // Checked here, on the queue, rather than only before queueing:
+                // Stop clears the route before queueing its clear, so a sample
+                // queued after Stop is dropped instead of re-simulating a route
+                // point once the clear has run. The caller re-checks the route
+                // and returns before looking at this code.
+                guard LocationSimulationSession.shared.isCurrentRoute(routeID) else {
+                    continuation.resume(returning: -1)
+                    return
+                }
                 continuation.resume(returning: locationUpdateCode(for: coordinate))
             }
         }
