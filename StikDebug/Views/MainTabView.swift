@@ -231,15 +231,12 @@ struct MainTabView: View {
                             longitude: coordinate.longitude
                         )
                     ) {
-                        LocationSimulationCommandQueue.shared.async {
-                            let code = simulate_location(
-                                DeviceConnectionContext.targetIPAddress,
-                                coordinate.latitude,
-                                coordinate.longitude,
-                                pairingFile.path
-                            )
-                            LocationSimulationSession.shared.noteResendResult(code)
-                        }
+                        simulate_location(
+                            DeviceConnectionContext.targetIPAddress,
+                            coordinate.latitude,
+                            coordinate.longitude,
+                            pairingFile.path
+                        )
                     }
                     LogManager.shared.addInfoLog(
                         String(format: "Simulated location from URL: %.6f, %.6f", coordinate.latitude, coordinate.longitude)

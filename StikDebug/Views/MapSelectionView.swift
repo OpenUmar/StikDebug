@@ -1415,9 +1415,7 @@ struct LocationSimulationView: View {
     private func startResendLoop(with coordinate: CLLocationCoordinate2D) {
         simulatedCoordinate = coordinate
         LocationSimulationSession.shared.startResending(at: coordinate) {
-            LocationSimulationCommandQueue.shared.async {
-                LocationSimulationSession.shared.noteResendResult(locationUpdateCode(for: coordinate))
-            }
+            locationUpdateCode(for: coordinate)
         }
     }
 
