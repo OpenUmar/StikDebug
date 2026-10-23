@@ -160,9 +160,22 @@ final class TunnelManager: ObservableObject {
             return
         }
 
-        // Cellular included: Remote Pairing port discovery may find the service
-        // where the fixed port was refused. A refusal is no longer retried, so
-        // a failing attempt here costs one discovery and one connect.
+        // Before iOS 27 the Remote Pairing service is on the fixed port 49152,
+        // which refuses connections on cellular-only, so an automatic attempt
+        // there is certain to fail after a Bonjour search that finds nothing.
+        // Port discovery targets the dynamic port of iOS 27.2 and later, where
+        // an attempt on cellular may succeed. Manual attempts (the user
+        // tapping) still go through start() directly.
+        if ProcessInfo.processInfo.operatingSystemVersion.majorVersion < 27,
+           status.interface == .cellular {
+            if interfaceChanged {
+                LogManager.shared.addInfoLog(
+                    "On cellular without Wi-Fi; deferring tunnel reconnect until a local network is available"
+                )
+            }
+            return
+        }
+
         LogManager.shared.addInfoLog("Network path changed (\(status.description)); reconnecting tunnel")
         start(showErrorUI: false)
     }
