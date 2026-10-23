@@ -48,16 +48,60 @@ final class LocationSimulationSession: ObservableObject {
         }
     }
 
-    /// Re-applies the held location every 4s. `operation` runs on
-    /// `LocationSimulationCommandQueue` and returns the simulation status code.
-    func startResending(at coordinate: CLLocationCoordinate2D, _ operation: @escaping () -> Int32) {
+    /// Re-applies the held location every 4s. `operation` receives the
+    /// coordinate to set, runs on `LocationSimulationCommandQueue`, and returns
+    /// the simulation status code.
+    func startResending(
+        at coordinate: CLLocationCoordinate2D,
+        _ operation: @escaping (CLLocationCoordinate2D) -> Int32
+    ) {
         start(at: coordinate)
+        driftOffset = (north: 0, east: 0)
         resendTimer?.invalidate()
         let timer = Timer(timeInterval: 4, repeats: true) { [weak self] _ in
-            self?.enqueueResend(operation)
+            guard let self else { return }
+            let target = self.nextResendCoordinate(around: coordinate)
+            self.enqueueResend { operation(target) }
         }
         RunLoop.main.add(timer, forMode: .common)
         resendTimer = timer
+    }
+
+    // MARK: - Drift
+
+    static let driftDefaultsKey = "simulatedLocationDrift"
+
+    /// A phone at rest still wanders a few meters because GPS is noisy, and Find
+    /// My reports more readily when the location changes. A held point that is
+    /// bit-for-bit identical on every resend can sit unreported until the shared
+    /// location ages into a stale (grey) pin. Wandering within a few meters of
+    /// the chosen spot looks like an ordinary stationary phone.
+    private static let driftRadiusMeters = 6.0
+    private static let driftStepMeters = 1.5
+
+    /// Meters north/east of the held coordinate. Main thread only.
+    private var driftOffset = (north: 0.0, east: 0.0)
+
+    private func nextResendCoordinate(around base: CLLocationCoordinate2D) -> CLLocationCoordinate2D {
+        guard UserDefaults.standard.bool(forKey: Self.driftDefaultsKey) else { return base }
+
+        let step = Self.driftStepMeters
+        var north = driftOffset.north + Double.random(in: -step...step)
+        var east = driftOffset.east + Double.random(in: -step...step)
+        let distance = (north * north + east * east).squareRoot()
+        if distance > Self.driftRadiusMeters {
+            let scale = Self.driftRadiusMeters / distance
+            north *= scale
+            east *= scale
+        }
+        driftOffset = (north: north, east: east)
+
+        let metersPerDegreeLatitude = 111_320.0
+        let metersPerDegreeLongitude = max(metersPerDegreeLatitude * cos(base.latitude * .pi / 180), 1)
+        return CLLocationCoordinate2D(
+            latitude: base.latitude + north / metersPerDegreeLatitude,
+            longitude: base.longitude + east / metersPerDegreeLongitude
+        )
     }
 
     /// Opening a fresh connection can block for several seconds while the Remote
@@ -243,11 +287,11 @@ final class LocationSimulationSession: ObservableObject {
         LogManager.shared.addInfoLog(
             String(format: "Restoring held simulated location: %.6f, %.6f", restored.latitude, restored.longitude)
         )
-        startResending(at: restored) {
+        startResending(at: restored) { target in
             simulate_location(
                 DeviceConnectionContext.targetIPAddress,
-                restored.latitude,
-                restored.longitude,
+                target.latitude,
+                target.longitude,
                 PairingFileStore.prepareURL().path
             )
         }

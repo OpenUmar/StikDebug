@@ -230,11 +230,11 @@ struct MainTabView: View {
                             latitude: coordinate.latitude,
                             longitude: coordinate.longitude
                         )
-                    ) {
+                    ) { target in
                         simulate_location(
                             DeviceConnectionContext.targetIPAddress,
-                            coordinate.latitude,
-                            coordinate.longitude,
+                            target.latitude,
+                            target.longitude,
                             pairingFile.path
                         )
                     }

@@ -18,6 +18,7 @@ struct SettingsView: View {
     @AppStorage(UserDefaults.Keys.confirmExternalJITRequests) private var confirmExternalJITRequests = true
     @AppStorage("keepAliveAudio") private var keepAliveAudio = true
     @AppStorage("keepAliveLocation") private var keepAliveLocation = true
+    @AppStorage(LocationSimulationSession.driftDefaultsKey) private var simulatedLocationDrift = true
     @AppStorage(UserDefaults.Keys.targetDeviceIP) private var targetDeviceIP = DeviceConnectionContext.defaultTargetIPAddress
     @AppStorage("TunnelRemotePairingPort") private var remotePairingPortOverride = ""
     @AppStorage(UserDefaults.Keys.mallocDebug) private var mallocDebug = false
@@ -121,6 +122,16 @@ struct SettingsView: View {
 
                 } header: {
                     Text("Background Keep-Alive")
+                }
+
+                Section("Location Simulation") {
+                    Toggle(isOn: $simulatedLocationDrift) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Natural GPS Drift")
+                            Text("Moves a held location a few meters at a time, like real GPS, so it keeps reporting as current.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
                 }
 
                 Section("Behavior") {
